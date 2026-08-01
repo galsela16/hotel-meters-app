@@ -13,21 +13,28 @@
 
 <!--
   ============================================================
-  סנכרון בין מכשירים (Supabase) - הגדרה חד-פעמית
+  סנכרון בין מכשירים (Firebase) - הגדרה חד-פעמית
   ============================================================
   כדי שהאפליקציה תסתנכרן בין כמה טלפונים, יש למלא כאן את פרטי
-  פרויקט ה-Supabase שלכם (הוראות מלאות ב-SETUP.md). ה-anonKey מיועד
-  מטבעו להיות ציבורי בקוד - ההגנה על הנתונים נעשית דרך Row Level
-  Security בצד Supabase, לא דרך הסתרת המפתח. אין כאן שום טוקן סודי.
+  פרויקט ה-Firebase שלכם (הוראות מלאות ב-SETUP.md). ה-apiKey מיועד
+  מטבעו להיות ציבורי בקוד - ההגנה על הנתונים נעשית דרך Firebase Rules
+  + התחברות אנונימית, לא דרך הסתרת המפתח. אין כאן שום טוקן סודי.
   עד שהפרטים לא יימולאו, האפליקציה תעבוד במצב מקומי בלבד.
 -->
 <script>
-  const SUPABASE_CONFIG = {
-    url: "",      // לדוגמה: https://xxxxxxxxxxxx.supabase.co
-    anonKey: ""   // המפתח הציבורי (anon/public) מהגדרות הפרויקט
+  const FIREBASE_CONFIG = {
+    apiKey: "",
+    authDomain: "",
+    databaseURL: "",
+    projectId: "",
+    storageBucket: "",
+    messagingSenderId: "",
+    appId: ""
   };
 </script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-database-compat.js"></script>
 <style>
   :root{
     --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef2f6; --border:#dfe5eb;
@@ -253,7 +260,7 @@
 
 </main>
 
-<footer>מעקב מונים · הנתונים נשמרים מקומית בדפדפן, ומסונכרנים לענן אם הוגדר Supabase</footer>
+<footer>מעקב מונים · הנתונים נשמרים מקומית בדפדפן, ומסונכרנים לענן אם הוגדר Firebase</footer>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -277,11 +284,10 @@ function save(){
   pushToCloud();
 }
 
-/* ---------- CLOUD SYNC (Supabase) ---------- */
-let sb = null;
-let realtimeChannel = null;
-const isSupabaseConfigured = !!(typeof SUPABASE_CONFIG !== 'undefined' && SUPABASE_CONFIG.url && SUPABASE_CONFIG.anonKey);
-const SB_ROW_ID = 1; // the whole app state lives in one row
+/* ---------- CLOUD SYNC (Firebase) ---------- */
+let cloudDb = null;
+let cloudReady = false;
+const isFirebaseConfigured = !!(typeof FIREBASE_CONFIG !== 'undefined' && FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.databaseURL);
 
 function setSyncStatus(text, ok){
   const color = ok===true ? 'var(--accent)' : (ok===false ? 'var(--danger)' : 'var(--muted)');
@@ -291,62 +297,60 @@ function setSyncStatus(text, ok){
   if(el2){ el2.textContent = text; el2.style.color = color; }
 }
 
-async function initCloudSync(){
-  if(!isSupabaseConfigured){
+function initCloudSync(){
+  if(!isFirebaseConfigured){
     setSyncStatus('📴 מצב מקומי בלבד (סנכרון לא הוגדר)', null);
     return;
   }
   try{
-    sb = supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey);
-    setSyncStatus('⏳ מתחבר ל-Supabase...', null);
-
-    const { data, error } = await sb.from('app_state').select('data').eq('id', SB_ROW_ID).maybeSingle();
-    if(error) throw error;
-    if(data && data.data && (data.data.meters || data.data.readings)){
-      state = { meters: data.data.meters||[], readings: data.data.readings||[] };
-      cacheLocally();
-      renderAll();
-    } else if(state.meters.length>0){
-      setSyncStatus('☁️ מחובר - יש נתונים מקומיים שטרם הועלו (ראו לשונית גיבוי)', null);
-    }
-    setSyncStatus('☁️ מסונכרן בין המכשירים', true);
-
-    realtimeChannel = sb.channel('app_state_changes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: `id=eq.${SB_ROW_ID}` }, payload=>{
-        const newRow = payload.new;
-        if(newRow && newRow.data && (newRow.data.meters || newRow.data.readings)){
-          state = { meters: newRow.data.meters||[], readings: newRow.data.readings||[] };
+    firebase.initializeApp(FIREBASE_CONFIG);
+    firebase.auth().signInAnonymously().catch(err=>{
+      console.error('Firebase auth error', err);
+      setSyncStatus('⚠ שגיאת התחברות לענן - עובד במצב מקומי', false);
+    });
+    firebase.auth().onAuthStateChanged(user=>{
+      if(!user) return;
+      cloudDb = firebase.database();
+      const stateRef = cloudDb.ref('state');
+      setSyncStatus('☁️ מחובר - מסתנכרן...', null);
+      stateRef.on('value', snap=>{
+        const cloudData = snap.val();
+        if(cloudData && (cloudData.meters || cloudData.readings)){
+          state = { meters: cloudData.meters || [], readings: cloudData.readings || [] };
           cacheLocally();
           renderAll();
+        } else if(cloudReady === false){
+          if(state.meters.length>0){
+            setSyncStatus('☁️ מחובר (יש נתונים מקומיים שטרם הועלו - ראו לשונית גיבוי)', null);
+          }
         }
-      })
-      .subscribe(status=>{
-        if(status==='SUBSCRIBED'){ setSyncStatus('☁️ מסונכרן בין המכשירים', true); }
-        if(status==='CHANNEL_ERROR' || status==='TIMED_OUT'){ setSyncStatus('⚠ שגיאת סנכרון בזמן אמת - שמירה ידנית עדיין תעבוד', false); }
+        cloudReady = true;
+        if(cloudData){ setSyncStatus('☁️ מסונכרן בין המכשירים', true); }
+      }, err=>{
+        console.error('Firebase read error', err);
+        setSyncStatus('⚠ שגיאת סנכרון - עובד במצב מקומי', false);
       });
+    });
   }catch(e){
-    console.error('Supabase init error', e);
-    setSyncStatus('⚠ שגיאת חיבור ל-Supabase - עובד במצב מקומי', false);
+    console.error('Firebase init error', e);
+    setSyncStatus('⚠ שגיאת הגדרת Firebase - עובד במצב מקומי', false);
   }
 }
 
 function pushToCloud(){
-  if(!sb) return;
-  sb.from('app_state').upsert({ id: SB_ROW_ID, data: state, updated_at: new Date().toISOString() }).then(({error})=>{
-    if(error){
-      console.error('Supabase write error', error);
-      setSyncStatus('⚠ שגיאה בשמירה ל-Supabase (הנתונים נשמרו מקומית)', false);
-    }
+  if(!cloudDb) return;
+  cloudDb.ref('state').set(state).catch(err=>{
+    console.error('Firebase write error', err);
+    setSyncStatus('⚠ שגיאה בשמירה לענן (הנתונים נשמרו מקומית)', false);
   });
 }
 
 function pushLocalToCloud(){
-  if(!sb){ showToast('הסנכרון ל-Supabase לא מוגדר עדיין'); return; }
-  if(!confirm('פעולה זו תעלה את הנתונים המקומיים ל-Supabase ותחליף כל מה שקיים שם. להמשיך?')) return;
-  sb.from('app_state').upsert({ id: SB_ROW_ID, data: state, updated_at: new Date().toISOString() }).then(({error})=>{
-    if(error){ console.error(error); showToast('שגיאה בהעלאת הנתונים'); }
-    else{ showToast('הנתונים הועלו ל-Supabase בהצלחה'); }
-  });
+  if(!cloudDb){ showToast('הסנכרון לענן לא מוגדר עדיין'); return; }
+  if(!confirm('פעולה זו תעלה את הנתונים המקומיים לענן ותחליף כל מה שקיים שם. להמשיך?')) return;
+  cloudDb.ref('state').set(state)
+    .then(()=> showToast('הנתונים הועלו לענן בהצלחה'))
+    .catch(err=>{ console.error(err); showToast('שגיאה בהעלאת הנתונים'); });
 }
 
 const TYPE_COLORS = {
