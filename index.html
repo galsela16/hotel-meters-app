@@ -13,23 +13,21 @@
 
 <!--
   ============================================================
-  סנכרון בין מכשירים (GitHub) - הגדרה חד-פעמית
+  סנכרון בין מכשירים (Supabase) - הגדרה חד-פעמית
   ============================================================
-  כדי שהאפליקציה תסתנכרן בין כמה טלפונים, הנתונים נשמרים כקובץ
-  data.json בתוך ריפו ב-GitHub, ונקראים/נכתבים דרך ה-GitHub API.
-  יש למלא כאן את הפרטים של הריפו וטוקן גישה. הוראות מלאות בקובץ
-  SETUP.md שצורף יחד עם קובץ זה. עד שהפרטים לא יימולאו, האפליקציה
-  תמשיך לעבוד במצב מקומי בלבד (כמו קודם, בלי סנכרון).
+  כדי שהאפליקציה תסתנכרן בין כמה טלפונים, יש למלא כאן את פרטי
+  פרויקט ה-Supabase שלכם (הוראות מלאות ב-SETUP.md). ה-anonKey מיועד
+  מטבעו להיות ציבורי בקוד - ההגנה על הנתונים נעשית דרך Row Level
+  Security בצד Supabase, לא דרך הסתרת המפתח. אין כאן שום טוקן סודי.
+  עד שהפרטים לא יימולאו, האפליקציה תעבוד במצב מקומי בלבד.
 -->
 <script>
-  const GITHUB_CONFIG = {
-    owner: "galsela16",   // שם המשתמש שלכם ב-GitHub
-    repo: "hotel-meters-app",    // שם הריפו
-    path: "data.json",
-    branch: "main",
-    token: "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"    // <-- הדביקו כאן את הטוקן שהעתקתם (בין הגרשיים), אל תשלחו אותו בצ'אט
+  const SUPABASE_CONFIG = {
+    url: "",      // לדוגמה: https://xxxxxxxxxxxx.supabase.co
+    anonKey: ""   // המפתח הציבורי (anon/public) מהגדרות הפרויקט
   };
 </script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   :root{
     --bg:#f4f6f9; --panel:#ffffff; --panel2:#eef2f6; --border:#dfe5eb;
@@ -255,7 +253,7 @@
 
 </main>
 
-<footer>מעקב מונים · הנתונים נשמרים מקומית בדפדפן, ומסונכרנים דרך GitHub אם הוגדר סנכרון</footer>
+<footer>מעקב מונים · הנתונים נשמרים מקומית בדפדפן, ומסונכרנים לענן אם הוגדר Supabase</footer>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -279,12 +277,11 @@ function save(){
   pushToCloud();
 }
 
-/* ---------- CLOUD SYNC (GitHub) ---------- */
-let ghSha = null; // last known sha of data.json, used for conflict-safe writes
-let ghPollTimer = null;
-let ghSyncing = false;
-const GITHUB_POLL_MS = 10000;
-const isGithubConfigured = !!(typeof GITHUB_CONFIG !== 'undefined' && GITHUB_CONFIG.owner && GITHUB_CONFIG.repo && GITHUB_CONFIG.token);
+/* ---------- CLOUD SYNC (Supabase) ---------- */
+let sb = null;
+let realtimeChannel = null;
+const isSupabaseConfigured = !!(typeof SUPABASE_CONFIG !== 'undefined' && SUPABASE_CONFIG.url && SUPABASE_CONFIG.anonKey);
+const SB_ROW_ID = 1; // the whole app state lives in one row
 
 function setSyncStatus(text, ok){
   const color = ok===true ? 'var(--accent)' : (ok===false ? 'var(--danger)' : 'var(--muted)');
@@ -294,109 +291,62 @@ function setSyncStatus(text, ok){
   if(el2){ el2.textContent = text; el2.style.color = color; }
 }
 
-function ghApiUrl(){
-  return `https://api.github.com/repos/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/contents/${GITHUB_CONFIG.path}`;
-}
-function ghHeaders(){
-  return {
-    'Authorization': 'Bearer ' + GITHUB_CONFIG.token,
-    'Accept': 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28'
-  };
-}
-function b64EncodeUnicode(str){ return btoa(unescape(encodeURIComponent(str))); }
-function b64DecodeUnicode(str){ return decodeURIComponent(escape(atob(str))); }
-
-// Fetch the current data.json. Returns {sha,data} or {sha:null,data:null} if the file doesn't exist yet.
-async function ghFetchFile(){
-  const res = await fetch(ghApiUrl() + '?ref=' + encodeURIComponent(GITHUB_CONFIG.branch), { headers: ghHeaders() });
-  if(res.status===404){ return { sha:null, data:null }; }
-  if(!res.ok){ throw new Error('GitHub read failed: ' + res.status); }
-  const json = await res.json();
-  const content = b64DecodeUnicode(json.content.replace(/\n/g,''));
-  return { sha: json.sha, data: JSON.parse(content) };
-}
-
-// Write data.json with optimistic-concurrency retry on conflicts.
-async function ghWriteFile(dataObj, attempt){
-  attempt = attempt || 1;
-  const body = {
-    message: 'עדכון נתוני מונים - ' + new Date().toISOString(),
-    content: b64EncodeUnicode(JSON.stringify(dataObj, null, 2)),
-    branch: GITHUB_CONFIG.branch
-  };
-  if(ghSha) body.sha = ghSha;
-  const res = await fetch(ghApiUrl(), {
-    method: 'PUT',
-    headers: Object.assign({ 'Content-Type': 'application/json' }, ghHeaders()),
-    body: JSON.stringify(body)
-  });
-  if(res.status===409 || res.status===422){
-    if(attempt>=4) throw new Error('GitHub write conflict - gave up after retries');
-    const fresh = await ghFetchFile();
-    ghSha = fresh.sha;
-    return ghWriteFile(dataObj, attempt+1);
-  }
-  if(!res.ok){ throw new Error('GitHub write failed: ' + res.status); }
-  const json = await res.json();
-  ghSha = json.content.sha;
-  return json;
-}
-
-function initCloudSync(){
-  if(!isGithubConfigured){
+async function initCloudSync(){
+  if(!isSupabaseConfigured){
     setSyncStatus('📴 מצב מקומי בלבד (סנכרון לא הוגדר)', null);
     return;
   }
-  setSyncStatus('⏳ מתחבר ל-GitHub...', null);
-  pollGithub();
-  if(ghPollTimer) clearInterval(ghPollTimer);
-  ghPollTimer = setInterval(pollGithub, GITHUB_POLL_MS);
-}
-
-async function pollGithub(){
-  if(ghSyncing) return;
-  ghSyncing = true;
   try{
-    const { sha, data } = await ghFetchFile();
-    if(sha===null){
-      ghSha = null;
-      setSyncStatus(state.meters.length>0
-        ? '☁️ מחובר - יש נתונים מקומיים שטרם הועלו (ראו לשונית גיבוי)'
-        : '☁️ מחובר ל-GitHub - ממתין לנתונים ראשונים', null);
-      return;
+    sb = supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey);
+    setSyncStatus('⏳ מתחבר ל-Supabase...', null);
+
+    const { data, error } = await sb.from('app_state').select('data').eq('id', SB_ROW_ID).maybeSingle();
+    if(error) throw error;
+    if(data && data.data && (data.data.meters || data.data.readings)){
+      state = { meters: data.data.meters||[], readings: data.data.readings||[] };
+      cacheLocally();
+      renderAll();
+    } else if(state.meters.length>0){
+      setSyncStatus('☁️ מחובר - יש נתונים מקומיים שטרם הועלו (ראו לשונית גיבוי)', null);
     }
-    if(sha !== ghSha){
-      ghSha = sha;
-      if(data && (data.meters || data.readings)){
-        state = { meters: data.meters||[], readings: data.readings||[] };
-        cacheLocally();
-        renderAll();
-      }
-    }
-    setSyncStatus('☁️ מסונכרן עם GitHub', true);
+    setSyncStatus('☁️ מסונכרן בין המכשירים', true);
+
+    realtimeChannel = sb.channel('app_state_changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_state', filter: `id=eq.${SB_ROW_ID}` }, payload=>{
+        const newRow = payload.new;
+        if(newRow && newRow.data && (newRow.data.meters || newRow.data.readings)){
+          state = { meters: newRow.data.meters||[], readings: newRow.data.readings||[] };
+          cacheLocally();
+          renderAll();
+        }
+      })
+      .subscribe(status=>{
+        if(status==='SUBSCRIBED'){ setSyncStatus('☁️ מסונכרן בין המכשירים', true); }
+        if(status==='CHANNEL_ERROR' || status==='TIMED_OUT'){ setSyncStatus('⚠ שגיאת סנכרון בזמן אמת - שמירה ידנית עדיין תעבוד', false); }
+      });
   }catch(e){
-    console.error('GitHub sync error', e);
-    setSyncStatus('⚠ שגיאת סנכרון עם GitHub - עובד במצב מקומי', false);
-  }finally{
-    ghSyncing = false;
+    console.error('Supabase init error', e);
+    setSyncStatus('⚠ שגיאת חיבור ל-Supabase - עובד במצב מקומי', false);
   }
 }
 
 function pushToCloud(){
-  if(!isGithubConfigured) return;
-  ghWriteFile(state).catch(err=>{
-    console.error('GitHub write error', err);
-    setSyncStatus('⚠ שגיאה בשמירה ל-GitHub (הנתונים נשמרו מקומית)', false);
+  if(!sb) return;
+  sb.from('app_state').upsert({ id: SB_ROW_ID, data: state, updated_at: new Date().toISOString() }).then(({error})=>{
+    if(error){
+      console.error('Supabase write error', error);
+      setSyncStatus('⚠ שגיאה בשמירה ל-Supabase (הנתונים נשמרו מקומית)', false);
+    }
   });
 }
 
 function pushLocalToCloud(){
-  if(!isGithubConfigured){ showToast('הסנכרון ל-GitHub לא מוגדר עדיין'); return; }
-  if(!confirm('פעולה זו תעלה את הנתונים המקומיים ל-GitHub ותחליף כל מה שקיים שם. להמשיך?')) return;
-  ghWriteFile(state)
-    .then(()=> showToast('הנתונים הועלו ל-GitHub בהצלחה'))
-    .catch(err=>{ console.error(err); showToast('שגיאה בהעלאת הנתונים ל-GitHub'); });
+  if(!sb){ showToast('הסנכרון ל-Supabase לא מוגדר עדיין'); return; }
+  if(!confirm('פעולה זו תעלה את הנתונים המקומיים ל-Supabase ותחליף כל מה שקיים שם. להמשיך?')) return;
+  sb.from('app_state').upsert({ id: SB_ROW_ID, data: state, updated_at: new Date().toISOString() }).then(({error})=>{
+    if(error){ console.error(error); showToast('שגיאה בהעלאת הנתונים'); }
+    else{ showToast('הנתונים הועלו ל-Supabase בהצלחה'); }
+  });
 }
 
 const TYPE_COLORS = {
